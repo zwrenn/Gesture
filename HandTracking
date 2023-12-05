@@ -1,0 +1,286 @@
+import cv2
+import mediapipe as mp
+import time
+
+# Initialize MediaPipe hands module
+mp_hands = mp.solutions.hands
+hands = mp_hands.Hands()
+
+# Initialize MediaPipe drawing module
+mp_drawing = mp.solutions.drawing_utils
+
+cap = cv2.VideoCapture(0)
+
+# For swipe detection
+previous_hand_center_x = None
+SWIPE_THRESHOLD = 0.03  # Adjust for sensitivity
+# Maximum of 2 seconds for the entire gesture. Adjust as necessary.
+TIME_LIMIT = 2
+previous_swipe_time = 0  # Initialize this variable before the while loop
+SWIPE_DELAY = 0.2  # Adjust this based on your requirements
+previous_index_x = None
+last_swipe_time = 0  # To track when the last swipe was detected
+COOLDOWN_PERIOD = 1.0  # in seconds
+
+# Swipe detection state and timer
+SWIPE_SEQUENCE_TIME_LIMIT = 1.0  # Time window in seconds for the complete sequence
+swipe_start_time = 0
+swipe_state = 0  # 0: Waiting for start, 1: Waiting for middle, 2: Waiting for end
+
+previous_index_tip_y = None
+previous_time = None
+SELECT_THRESHOLD = 0.05  # Adjust as necessary based on testing
+# Threshold for "quick" bending, in seconds. Adjust as needed.
+TIME_THRESHOLD = 0.2
+
+# For slider visualization
+slider_pos = 0.5  # A value between 0 and 1 representing the position on the slider
+slider_length = 300  # The length of the slider in pixels
+slider_width = 30  # The width of the slider in pixels
+circle_radius = 15  # The radius of the circle on the slider
+
+pinch_active = False  # To track if a pinch is currently active
+
+# Dropdown
+
+
+class DropDown:
+    def __init__(self, x, y, width, height, options):
+        self.x = x
+        self.y = y
+        self.width = width
+        self.height = height
+        self.options = options
+        self.current_option = 0
+        self.active = False
+        self.selected_option = None  # Add this line
+
+    def draw(self, frame):
+        if self.active:
+            for i, option in enumerate(self.options):
+                # Modify this condition to check for selected_option
+                color = (0, 0, 255) if i == self.selected_option else (
+                    255, 255, 255) if i == self.current_option else (200, 200, 200)
+        for i, option in enumerate(self.options):
+            color = (255, 255, 255) if i == self.current_option else (
+                200, 200, 200)
+            cv2.rectangle(frame, (self.x, self.y + i * self.height),
+                          (self.x + self.width, self.y + (i+1) * self.height), color, -1)
+            cv2.putText(frame, option, (self.x + 10, self.y + (i+1) * self.height - 10),
+                        cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 0, 0), 1, cv2.LINE_AA)
+
+
+# Initialize dropdown
+dropdown = DropDown(
+    50, 50, 200, 30, ['Option 1', 'Option 2', 'Option 3', 'Option 4'])
+
+
+class Square:
+    def __init__(self, x, y, width, height, color):
+        self.x = x
+        self.y = y
+        self.width = width
+        self.height = height
+        self.color = color
+
+    def draw(self, frame):
+        cv2.rectangle(frame, (self.x, self.y), (self.x +
+                                                self.width, self.y+self.height), self.color, -1)
+
+square1 = Square(100, 150, 200, 200, (255, 0, 0))
+square2 = Square(350, 150, 200, 200, (0, 255, 0))
+square3 = Square(600, 150, 200, 200, (0, 0, 255))
+
+squares = [square1, square2, square3]
+active_square_index = 0
+
+while cap.isOpened():
+    try:
+        ret, frame = cap.read()
+        if not ret:
+            break
+
+        rgb_frame = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
+        results = hands.process(rgb_frame)
+
+        # Check if we have any hand landmarks
+        if results.multi_hand_landmarks:
+            for hand_landmarks in results.multi_hand_landmarks:
+                # Extract landmarks
+                index_finger_tip = hand_landmarks.landmark[mp_hands.HandLandmark.INDEX_FINGER_TIP]
+                index_finger_pip = hand_landmarks.landmark[mp_hands.HandLandmark.INDEX_FINGER_PIP]
+                middle_finger_tip = hand_landmarks.landmark[mp_hands.HandLandmark.MIDDLE_FINGER_TIP]
+                middle_finger_pip = hand_landmarks.landmark[mp_hands.HandLandmark.MIDDLE_FINGER_PIP]
+                ring_finger_tip = hand_landmarks.landmark[mp_hands.HandLandmark.RING_FINGER_TIP]
+                ring_finger_pip = hand_landmarks.landmark[mp_hands.HandLandmark.RING_FINGER_PIP]
+                pinky_tip = hand_landmarks.landmark[mp_hands.HandLandmark.PINKY_TIP]
+                pinky_pip = hand_landmarks.landmark[mp_hands.HandLandmark.PINKY_PIP]
+                thumb_tip = hand_landmarks.landmark[mp_hands.HandLandmark.THUMB_TIP]
+                thumb_mcp = hand_landmarks.landmark[mp_hands.HandLandmark.THUMB_MCP]
+
+                # Dropdown Activation
+                index_finger_x = int(index_finger_tip.x * frame.shape[1])
+                index_finger_y = int(index_finger_tip.y * frame.shape[0])
+
+                hovering_dropdown = (dropdown.x < index_finger_x < dropdown.x + dropdown.width and
+                                     dropdown.y < index_finger_y < dropdown.y + len(dropdown.options) * dropdown.height)
+
+                if hovering_dropdown:
+                    dropdown.active = True
+                else:
+                    dropdown.active = False
+
+                # Dropdown Scrolling
+                if dropdown.active:
+                    if previous_index_y is not None:
+                        delta_y = index_finger_y - previous_index_y
+                        if delta_y > 10:  # Scroll down
+                            dropdown.current_option = min(
+                                len(dropdown.options) - 1, dropdown.current_option + 1)
+                        elif delta_y < -10:  # Scroll up
+                            dropdown.current_option = max(
+                                0, dropdown.current_option - 1)
+                    previous_index_y = index_finger_y
+
+                # Calculate the center of the hand for swipe detection
+                all_x_positions = [
+                    landmark.x for landmark in hand_landmarks.landmark]
+                all_y_positions = [
+                    landmark.y for landmark in hand_landmarks.landmark]
+                hand_center_x = sum(all_x_positions) / len(all_x_positions)
+                hand_center_y = sum(all_y_positions) / len(all_y_positions)
+
+                current_time = time.time()
+
+                # New swipe detection with cooldown
+                index_finger_tip_x = index_finger_tip.x
+                thumb_tip_x = thumb_tip.x
+                
+                if not pinch_active and previous_index_x is not None and (current_time - last_swipe_time) > COOLDOWN_PERIOD:
+                    # If the index finger tip crosses the thumb from left to right
+                    if previous_index_x < thumb_tip_x and index_finger_tip_x > thumb_tip_x:
+                        print("Swipe Right")
+                        active_square_index = max(0, active_square_index - 1)
+                        last_swipe_time = current_time
+                    # If the index finger tip crosses the thumb from right to left
+                    elif previous_index_x > thumb_tip_x and index_finger_tip_x < thumb_tip_x:
+                        print("Swipe Left")
+                        active_square_index = min(len(squares) - 1, active_square_index + 1)
+                        last_swipe_time = current_time
+
+                previous_index_x = index_finger_tip_x
+
+                # Pinch Detection
+                distance_thumb_index = ((thumb_tip.x - index_finger_tip.x) ** 2 +
+                                        (thumb_tip.y - index_finger_tip.y) ** 2) ** 0.5
+                if distance_thumb_index < 0.05:  # Threshold might need tuning
+                    pinch_active = True
+                    print("Pinch detected!")
+                else:
+                    pinch_active = False
+
+                # If pinch is active, detect vertical drag
+                if pinch_active and previous_hand_center_y:
+                    delta_y = hand_center_y - previous_hand_center_y
+                    slider_pos -= delta_y  # Minus because screen y-coordinates increase downwards
+                    # Clamp the value between 0 and 1
+                    slider_pos = max(0, min(1, slider_pos))
+
+                previous_hand_center_y = hand_center_y
+
+                # Draw the slider
+                slider_top_left = (
+                    50, int(frame.shape[0] / 2 - slider_length / 2))
+                slider_bottom_right = (
+                    50 + slider_width, int(frame.shape[0] / 2 + slider_length / 2))
+                cv2.rectangle(frame, slider_top_left, slider_bottom_right,
+                              color=(255, 255, 255), thickness=2)
+
+                circle_center = (
+                    50 + slider_width // 2, int(slider_top_left[1] + (1 - slider_pos) * slider_length))
+                cv2.circle(frame, circle_center, circle_radius,
+                           color=(0, 0, 255), thickness=-1)
+
+                # Fist Detection
+                if (index_finger_tip.y > index_finger_pip.y and
+                    middle_finger_tip.y > middle_finger_pip.y and
+                    ring_finger_tip.y > ring_finger_pip.y and
+                    pinky_tip.y > pinky_pip.y):
+                    print("Fist is closed!")
+
+                # Pointer finger is up
+                elif (index_finger_tip.y < index_finger_pip.y and 
+                    middle_finger_tip.y > middle_finger_pip.y and
+                    ring_finger_tip.y > ring_finger_pip.y and
+                    pinky_tip.y > pinky_pip.y):
+                    print("Only pointer finger is up!")
+
+                # Both pointer (index) and middle fingers up
+                elif (index_finger_tip.y < index_finger_pip.y and
+                    middle_finger_tip.y < middle_finger_pip.y and
+                    ring_finger_tip.y > ring_finger_pip.y and
+                    pinky_tip.y > pinky_pip.y):
+                    print("Pointer and Middle fingers are up!")
+
+                # L sign detection
+                elif (index_finger_tip.y < index_finger_pip.y and
+                      middle_finger_tip.y > middle_finger_pip.y and
+                      ring_finger_tip.y > ring_finger_pip.y and
+                      pinky_tip.y > pinky_pip.y and
+                      thumb_tip.x > thumb_mcp.x):
+                    print("L sign")
+
+                # Update the slider position based on drag
+                if previous_hand_center_y:
+                    delta_y = hand_center_y - previous_hand_center_y
+                    slider_pos -= delta_y  # Minus because screen y-coordinates increase downwards
+                    # Clamp the value between 0 and 1
+                    slider_pos = max(0, min(1, slider_pos))
+
+                # Draw the circle on the slider at the current position
+                circle_center = (
+                    50 + slider_width // 2, int(slider_top_left[1] + (1 - slider_pos) * slider_length))
+                cv2.circle(frame, circle_center, circle_radius, color=(
+                    0, 0, 255), thickness=-1)  # -1 thickness means filled circle
+
+                previous_hand_center_y = hand_center_y
+
+                # Check if the pointer finger is up
+                pointer_finger_up = index_finger_tip.y < index_finger_pip.y
+
+                current_time = time.time()
+
+                # Determine if the index finger has bent quickly and pointer finger is up
+                if not pinch_active and pointer_finger_up and previous_index_tip_y is not None and previous_time is not None:
+                    delta_y = index_finger_tip.y - previous_index_tip_y
+                    delta_time = current_time - previous_time
+                    if delta_y > SELECT_THRESHOLD and delta_time < TIME_THRESHOLD:
+                        print("Select action triggered!")
+                        if dropdown.active:  # If the dropdown is active, set the selected option
+                            dropdown.selected_option = dropdown.current_option
+
+                previous_index_tip_y = index_finger_tip.y
+                previous_time = current_time
+
+                # Draw landmarks on the frame
+                mp_drawing.draw_landmarks(
+                    frame, hand_landmarks, mp_hands.HAND_CONNECTIONS)
+
+        # Always draw dropdown for testing
+        dropdown.draw(frame)
+
+        # Draw active square
+        squares[active_square_index].draw(frame)
+
+        # Display the frame
+        cv2.imshow('Hand Tracking', frame)
+
+        if cv2.waitKey(1) & 0xFF == ord('q'):
+            break
+
+    except Exception as e:
+        print(e)
+        break
+
+cap.release()
+cv2.destroyAllWindows()
