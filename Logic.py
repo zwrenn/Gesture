@@ -13,17 +13,22 @@ from threading import Lock
 last_x_press_time = 0
 COOLDOWN_TIME = 1
 last_fist_time = 0
-FIST_COOLDOWN_TIME = 1
+FIST_COOLDOWN_TIME = 3
+trigger_fist_cooldown = False
 fist_counter = 0
 FIST_CONFIDENCE_THRESHOLD = 4
 three_fingers_counter = 0
 THREE_FINGERS_CONFIDENCE_THRESHOLD = 3
 last_three_finger_time = 0
-THREE_FINGER_COOLDOWN_TIME = 1
+THREE_FINGER_COOLDOWN_TIME = 1  # Cooldown time in seconds
+# Number of frames to confirm the gesture
+GESTURE_MAINTAINED_FRAMES = 10
 last_record_time = 0
-RECORD_COOLDOWN_TIME = 1
-is_recording = False
-is_recording_lock = Lock()
+# Time in seconds before the record function can be triggered again
+RECORD_COOLDOWN_TIME = 2
+record_active = False  # Tracks whether the record function is currently active
+is_recording = False  # Global variable to track recording state
+is_recording_lock = Lock()  # Lock for synchronizing access to is_recording
 
 # Kalman filter parameters
 initial_state_covariance = 0.1
@@ -75,6 +80,8 @@ def pause_logic_pro():
         except Exception as e:
             print(f"An error occurred: {e}")
 
+# Function to press "B" key (Swipe Left)
+
 
 def press_b_key():
     try:
@@ -82,12 +89,16 @@ def press_b_key():
     except Exception as e:
         print(f"An error occurred: {e}")
 
+# Function to press "R" key (Two fingers up)
+
 
 def press_r_key():
     try:
         os.system("osascript '/Users/ZoesComputer/Desktop/Tracking/PressRKey.scpt'")
     except Exception as e:
         print(f"An error occurred: {e}")
+
+# Function to press "X" key (Three fingers up)
 
 
 def press_x_key():
@@ -105,22 +116,30 @@ def listen_for_commands():
     while True:
         try:
             with microphone as source:
-                recognizer.adjust_for_ambient_noise(source, duration=0.5)
+                recognizer.adjust_for_ambient_noise(
+                    source, duration=0.3)  # Reduced duration
                 print("Listening for command...")
                 audio = recognizer.listen(
-                    source, timeout=5, phrase_time_limit=3)
+                    source, timeout=3, phrase_time_limit=2)  # Reduced timeouts
 
             command = recognizer.recognize_google(audio).lower()
             print(f"Recognized command: {command}")
 
-            if "tamber" in command or "timber" in command:
-                with is_recording_lock:  # Acquire lock
-                    if "start recording" in command and not is_recording:
+            with is_recording_lock:  # Acquire lock
+                if "start recording" in command:
+                    if not is_recording:
                         press_r_key()  # Start recording
                         is_recording = True
-                    elif "stop recording" in command and is_recording:
+                        print("Action: Started recording")
+                    else:
+                        print("Recording already started")
+                elif "stop recording" in command:
+                    if is_recording:
                         pause_logic_pro()  # Stop recording
                         is_recording = False
+                        print("Action: Stopped recording")
+                    else:
+                        print("Recording already stopped")
         except sr.WaitTimeoutError:
             print("Listening timed out, no phrase detected.")
             continue
@@ -133,9 +152,11 @@ def listen_for_commands():
             continue
 
 
+# Start the listen_for_commands function in a separate thread
 voice_thread = threading.Thread(target=listen_for_commands)
 voice_thread.start()
 
+# Video capture and main processing loop
 cap = cv2.VideoCapture(0)
 
 # Main processing loop
@@ -150,11 +171,13 @@ while cap.isOpened():
 
         if results.multi_hand_landmarks:
             for hand_landmarks in results.multi_hand_landmarks:
+                # Apply Kalman Filter for smoothing each landmark
                 filtered_landmarks = {}
                 for i, landmark in enumerate(hand_landmarks.landmark):
                     filtered_landmarks[i] = kalman_filter_process(
                         landmark, kalman_filters[i])
 
+                # Access landmarks using their enumeration values
                 thumb_tip = filtered_landmarks.get(
                     mp_hands.HandLandmark.THUMB_TIP.value)
                 index_finger_tip = filtered_landmarks.get(
@@ -174,19 +197,26 @@ while cap.isOpened():
                 pinky_pip = filtered_landmarks.get(
                     mp_hands.HandLandmark.PINKY_PIP.value)
 
-                # Fist Detection with Confidence
-                if (index_finger_tip[1] > index_finger_pip[1] and
-                    middle_finger_tip[1] > middle_finger_pip[1] and
-                    ring_finger_tip[1] > ring_finger_pip[1] and
-                        pinky_tip[1] > pinky_pip[1]):
-                    fist_counter += 1
-                    if fist_counter >= FIST_CONFIDENCE_THRESHOLD and time.time() - last_fist_time > FIST_COOLDOWN_TIME:
-                        print("Pause (Fist is closed)")
-                        pause_logic_pro()
-                        last_fist_time = time.time()
-                        fist_counter = 0
-                else:
-                    fist_counter = 0
+                # Gesture recognition logic
+                if thumb_tip is not None and index_finger_tip is not None and middle_finger_tip is not None:
+                    # Fist Detection with Confidence
+                    if (index_finger_tip[1] > index_finger_pip[1] and
+                        middle_finger_tip[1] > middle_finger_pip[1] and
+                        ring_finger_tip[1] > ring_finger_pip[1] and
+                            pinky_tip[1] > pinky_pip[1]):
+                        fist_counter += 1
+
+                        if fist_counter >= FIST_CONFIDENCE_THRESHOLD:
+                            if trigger_fist_cooldown and (time.time() - last_fist_time < FIST_COOLDOWN_TIME):
+                                pass  # Skip the fist action if within the cooldown period
+                            else:
+                                last_fist_time = time.time()  # Update last fist time
+                                trigger_fist_cooldown = False  # Reset flag
+                                print("Pause (Fist is closed)")
+                                pause_logic_pro()  # Pause Logic Pro
+                    else:
+                        fist_counter = 0  # Reset the counter if fist is not detected
+                        logic_pro_paused = False  # Reset Logic Pro pause flag
 
                 # Three Fingers Up Detection with Confidence
                 if (index_finger_tip[1] < index_finger_pip[1] and
@@ -203,26 +233,28 @@ while cap.isOpened():
                     three_fingers_counter = 0
 
                 # Two Fingers Up Detection with Confidence (for recording)
-                if (time.time() - last_record_time > RECORD_COOLDOWN_TIME):
+                if three_fingers_counter < THREE_FINGERS_CONFIDENCE_THRESHOLD:
                     if (index_finger_tip[1] < index_finger_pip[1] and
                         middle_finger_tip[1] < middle_finger_pip[1] and
                         ring_finger_tip[1] > ring_finger_pip[1] and
                             pinky_tip[1] > pinky_pip[1]):
-                        with is_recording_lock:
-                            if not is_recording:
-                                print("Start Recording")
-                                press_r_key()
-                                is_recording = True
-                            else:
-                                print("Stop Recording")
-                                pause_logic_pro()
-                                is_recording = False
-                        last_record_time = time.time()
-                else:
-                    # Do not reset the timer here to ensure cooldown works
-                    pass  # No operation
 
+                        with is_recording_lock:  # Synchronize access to is_recording
+                            if time.time() - last_record_time > RECORD_COOLDOWN_TIME:
+                                last_record_time = time.time()  # Update the last record time
+
+                                if not is_recording:
+                                    print("Start Recording")
+                                    press_r_key()  # Start recording
+                                    is_recording = True
+                                else:
+                                    print("Stop Recording")
+                                    pause_logic_pro()  # Stop recording
+                                    is_recording = False
+
+        # Display the frame
         cv2.imshow('Hand Tracking', frame)
+
         if cv2.waitKey(1) & 0xFF == ord('q'):
             break
 
@@ -230,8 +262,7 @@ while cap.isOpened():
         print(e)
         break
 
-# [End of main loop]
-
+# Close the voice command thread and release resources
 voice_thread.join()
 cap.release()
 cv2.destroyAllWindows()
